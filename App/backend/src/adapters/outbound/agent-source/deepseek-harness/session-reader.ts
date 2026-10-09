@@ -1,123 +1,51 @@
-import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
-import { decompress, ZstdErrorCode } from "fzstd";
+import {
+  loadDeepseekHarnessEvents,
+  readDeepseekHarnessEvents,
+  type RawSourceMessage
+} from "@memmy/agent-source-core";
 
-const ZSTD_FRAME_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+export { loadDeepseekHarnessEvents } from "@memmy/agent-source-core";
 
-export interface RawDeepseekHarnessMessage {
-  messageId: string;
-  conversationId: string;
-  role: "user" | "assistant";
-  content: string;
-  createdAt: string;
+export interface RawDeepseekHarnessMessage extends RawSourceMessage {
   workspacePath: string | null;
-  rawMeta: Readonly<Record<string, unknown>>;
 }
 
 export async function readDeepseekHarnessSession(
   filePath: string,
   signal?: AbortSignal
 ): Promise<RawDeepseekHarnessMessage[]> {
-  signal?.throwIfAborted();
-  const bytes = await readFile(filePath);
-  signal?.throwIfAborted();
-  const text = filePath.endsWith(".zstd") ? decompressFrames(bytes) : bytes.toString("utf8");
-  return parseSessionRows(text, filePath, signal);
+  const events = await loadDeepseekHarnessEvents(filePath, signal);
+  return (await collect(readDeepseekHarnessEvents(events, signal))).map(withWorkspace);
 }
 
-function decompressFrames(bytes: Buffer): string {
-  if (!bytes.subarray(0, ZSTD_FRAME_MAGIC.length).equals(ZSTD_FRAME_MAGIC)) {
-    throw new Error("DeepSeek Harness session has no Zstandard frame header");
-  }
-
-  try {
-    return Buffer.from(decompress(bytes)).toString("utf8");
-  } catch (error) {
-    if (!isUnexpectedEndOfFile(error)) throw error;
-    const trailingFrameOffset = bytes.lastIndexOf(ZSTD_FRAME_MAGIC);
-    if (trailingFrameOffset <= 0) throw error;
-    return Buffer.from(decompress(bytes.subarray(0, trailingFrameOffset))).toString("utf8");
-  }
-}
-
-function isUnexpectedEndOfFile(error: unknown): boolean {
-  return typeof error === "object"
-    && error !== null
-    && "code" in error
-    && error.code === ZstdErrorCode.UnexpectedEOF;
-}
-
-function parseSessionRows(
-  text: string,
+/** Streams one session as staged native turns. Compressed files are decoded first. */
+export async function* streamDeepseekHarnessSession(
   filePath: string,
   signal?: AbortSignal
-): RawDeepseekHarnessMessage[] {
-  const records = text.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line) as unknown);
-  const header = records.find((record) => isRecord(record) && record.type === "session");
-  const conversationId = isRecord(header) && typeof header.id === "string"
-    ? header.id
-    : basename(filePath).replace(/\.jsonl(?:\.zstd)?$/u, "");
-  const workspacePath = isRecord(header) && typeof header.cwd === "string" ? header.cwd : null;
-  const messages: RawDeepseekHarnessMessage[] = [];
-
-  for (const record of records) {
-    signal?.throwIfAborted();
-    const message = toMessage(record, conversationId, workspacePath);
-    if (message) messages.push(message);
+): AsyncIterable<RawDeepseekHarnessMessage> {
+  const events = await loadDeepseekHarnessEvents(filePath, signal);
+  if (!events.some((event) => event.type === "session")) {
+    const fallbackId = basename(filePath).replace(/\.jsonl(?:\.zstd)?$/u, "");
+    for await (const message of readDeepseekHarnessEvents([{ type: "session", id: fallbackId }, ...events], signal)) {
+      yield withWorkspace(message);
+    }
+    return;
   }
-  return messages;
+  for await (const message of readDeepseekHarnessEvents(events, signal)) {
+    yield withWorkspace(message);
+  }
 }
 
-function toMessage(
-  value: unknown,
-  conversationId: string,
-  workspacePath: string | null
-): RawDeepseekHarnessMessage | null {
-  if (!isRecord(value) || !isRecord(value.data)) return null;
-  const rawMessage = value.type === "user/message"
-    ? value.data
-    : value.type === "assistant/message" && isRecord(value.data.message)
-      ? value.data.message
-      : null;
-  if (!rawMessage) return null;
-  if (value.type === "user/message" && (!isRecord(rawMessage.source) || rawMessage.source.kind !== "user")) {
-    return null;
-  }
-  const role = rawMessage.role;
-  if (role !== "user" && role !== "assistant") return null;
-  const content = contentText(rawMessage.content);
-  if (!content) return null;
-  const seq = typeof value.seq === "number" ? value.seq : messagesFallbackSeq(value);
+function withWorkspace(message: RawSourceMessage): RawDeepseekHarnessMessage {
   return {
-    messageId: typeof rawMessage.id === "string" ? rawMessage.id : `${conversationId}:${seq}`,
-    conversationId,
-    role,
-    content,
-    createdAt: normalizeTimestamp(value.time),
-    workspacePath,
-    rawMeta: Object.freeze({ seq })
+    ...message,
+    workspacePath: typeof message.rawMeta.workspacePath === "string" ? message.rawMeta.workspacePath : null
   };
 }
 
-function contentText(value: unknown): string {
-  if (!Array.isArray(value)) return "";
-  return value.filter(isRecord)
-    .filter((block) => block.type === "text" && typeof block.text === "string")
-    .map((block) => String(block.text).trim())
-    .filter(Boolean)
-    .join("\n")
-    .trim();
-}
-
-function normalizeTimestamp(value: unknown): string {
-  const date = new Date(typeof value === "number" || typeof value === "string" ? value : 0);
-  return Number.isNaN(date.getTime()) ? new Date(0).toISOString() : date.toISOString();
-}
-
-function messagesFallbackSeq(value: Record<string, unknown>): number {
-  return typeof value.time === "number" ? value.time : 0;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+async function collect<T>(values: AsyncIterable<T>): Promise<T[]> {
+  const items: T[] = [];
+  for await (const value of values) items.push(value);
+  return items;
 }

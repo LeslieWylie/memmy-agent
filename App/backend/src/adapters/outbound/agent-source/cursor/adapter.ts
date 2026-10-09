@@ -1,10 +1,10 @@
 /** Adapter module. */
 import { access } from "node:fs/promises";
 import { resolveCursorDataPaths } from "../../agent-paths.js";
-import { collectConversationWindow, remainingMessageCapacity } from "../conversation-window.js";
+import { streamConversationWindow, remainingMessageCapacity } from "../conversation-window.js";
 import { redactSecrets } from "../secret-redactor.js";
 import type { ConversationMessage, ScanOptions, SourceAdapter, SourceDescriptor } from "../types.js";
-import { readCursorVscdb, type RawCursorMessage } from "./vscdb-reader.js";
+import { readCursorVscdb, streamCursorVscdb, type RawCursorMessage } from "./vscdb-reader.js";
 import { discoverCursorWorkspaces, type CursorWorkspace } from "./workspace-discovery.js";
 
 const CURSOR_SOURCE_ID = "cursor";
@@ -84,13 +84,15 @@ export function createCursorSourceAdapter(deps: CreateCursorSourceAdapterDeps = 
           message: target.storageHash
         });
 
-        const messages = await collectConversationWindow(
-          readCursorVscdb(target.stateDbPath),
+        for await (const rawMessage of streamConversationWindow(
+          options.fullHistory
+            ? streamCursorVscdb(target.stateDbPath, options.signal)
+            : readCursorVscdb(target.stateDbPath, options.signal),
           options.since,
           options.signal,
-          remainingMessageCapacity(options.maxMessages, emittedMessages)
-        );
-        for (const rawMessage of messages) {
+          remainingMessageCapacity(options.maxMessages, emittedMessages),
+          options.fullHistory
+        )) {
           throwIfAborted(options.signal);
           options.onProgress?.({
             sourceId: descriptor.sourceId,
@@ -175,6 +177,7 @@ function toConversationMessage(
     createdAt: rawMessage.createdAt,
     workspacePath: target.workspacePath,
     gitRoot: target.gitRoot,
+    ordinal: rawMessage.ordinal,
     rawMeta: Object.freeze({
       ...rawMessage.rawMeta,
       cursorStorageHash: target.storageHash
