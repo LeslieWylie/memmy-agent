@@ -953,19 +953,25 @@ function resolveMemoryEmbedding(
   hasCatalog: boolean
 ): Record<string, unknown> {
   const embedding = asRecord(memory.embedding);
-  const configuredMode = optionalString(embedding.mode);
-  const embeddingMode = configuredMode === "cloud"
-    || configuredMode === "local"
-    || configuredMode === "custom"
-    ? configuredMode
-    : mode === "account" && hasCatalog
-      ? "cloud"
-      : DEFAULT_MEMMY_CONFIG.embedding.mode;
   const activeAssignment = mode
     ? asRecord(asRecord(rootConfig.modelAssignments)[mode])
     : {};
   const rawAssignedPreset = activeAssignment.embedding;
   const hasExplicitAssignment = rawAssignedPreset !== undefined && rawAssignedPreset !== null;
+  const resolved = resolveMemoryAssignment(rootConfig, mode, "embedding");
+  const configuredMode = optionalString(embedding.mode);
+  const embeddingMode = configuredMode === "cloud"
+    || configuredMode === "local"
+    || configuredMode === "custom"
+    ? configuredMode
+    : rawAssignedPreset === BUILTIN_LOCAL_EMBEDDING_ASSIGNMENT_ID
+      || (mode === "byok" && hasCatalog && !hasExplicitAssignment)
+      ? "local"
+      : hasExplicitAssignment && resolved.ok && embeddingProtocolSupported(resolved.context.protocol)
+        ? resolved.context.source === "account" ? "cloud" : "custom"
+        : mode === "account" && hasCatalog
+          ? "cloud"
+          : DEFAULT_MEMMY_CONFIG.embedding.mode;
   if (rawAssignedPreset === BUILTIN_LOCAL_EMBEDDING_ASSIGNMENT_ID) {
     const assignmentOwner = optionalString(activeAssignment.ownerAccountId);
     const activeAccountId = optionalString(asRecord(rootConfig.app).userId);
@@ -994,8 +1000,6 @@ function resolveMemoryEmbedding(
     };
   }
 
-  const resolved = resolveMemoryAssignment(rootConfig, mode, "embedding");
-
   if (mode === "byok" && hasCatalog && !hasExplicitAssignment) {
     return localEmbeddingConfig(embedding);
   }
@@ -1012,7 +1016,7 @@ function resolveMemoryEmbedding(
     return localEmbeddingConfig(embedding);
   }
 
-  if (embeddingMode === "custom") {
+  if (embeddingMode === "custom" && (configuredMode === "custom" || !hasExplicitAssignment)) {
     const custom = asRecord(embedding.custom);
     return {
       ...embedding,
